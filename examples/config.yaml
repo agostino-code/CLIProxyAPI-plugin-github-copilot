@@ -1,0 +1,23 @@
+# Merge into an existing host configuration. Do not replace its credentials.
+plugins:
+  enabled: true
+  dir: ./plugins
+  configs:
+    github-copilot:
+      enabled: true
+      model_prefix: copilot # Blank also uses copilot; trailing slashes are normalized.
+      models: [] # Optional allowlist of {name, alias?}; empty discovers all eligible models.
+      # models:
+      #   - name: gpt-6-sol # Exposed as copilot/gpt-6-sol, if eligible.
+      #   - name: gpt-6-sol
+      #     alias: coding # Explicit aliases replace the entire prefixed ID.
+      models_excluded: [] # Example: ["claude-"] when native Claude owns these IDs.
+      github_client_id: Iv1.b507a08c87ecfe98 # Public device-flow client ID, not a secret.
+      github_scope: read:user
+      github_base_url: https://github.com
+      github_api_url: https://api.github.com
+      copilot_api_url: https://api.githubcopilot.com
+      allow_insecure_base_urls: false # Test-only HTTP on loopback.
+      oauth_timeout_seconds: 900
+      model_cache_ttl_seconds: 60 # 30-60 seconds, never stale fallback.
+      token_expiry_buffer_seconds: 300

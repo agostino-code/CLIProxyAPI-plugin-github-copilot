@@ -1,0 +1,121 @@
+name: Package plugin-store release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-26.04-arm
+            goos: linux
+            goarch: arm64
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+          - runner: ubuntu-26.04
+            goos: freebsd
+            goarch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate version and platform
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION=0.1.0; fi
+          [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]]
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          if [[ '${{ matrix.goos }}' != freebsd ]]; then
+            test "$(go env GOOS)/$(go env GOARCH)" = '${{ matrix.goos }}/${{ matrix.goarch }}'
+          fi
+      - run: make check
+      - name: Verify modules and scan reachable vulnerabilities
+        run: make audit
+      - if: matrix.goos != 'freebsd'
+        run: make build VERSION="$VERSION" REPOSITORY='https://github.com/${{ github.repository }}'
+      - name: Install FreeBSD cross-compilation tools
+        if: matrix.goos == 'freebsd'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld binutils xz-utils
+      - name: Cross-build FreeBSD AMD64 (no VM)
+        if: matrix.goos == 'freebsd'
+        env:
+          REPOSITORY: https://github.com/${{ github.repository }}
+        run: ./scripts/build-freebsd.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plugin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/**/*.so
+            dist/**/*.dylib
+          if-no-files-found: error
+
+  package:
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # goreleaser's changelog needs the full commit history and tags.
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: plugin-*
+          path: dist
+          merge-multiple: true
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.18.2
+          # On a version tag this publishes a draft GitHub Release (see
+          # .goreleaser.yml release.draft); any other trigger only builds the
+          # ZIPs and checksums under release/ for the workflow artifact below.
+          # A single space, not '', is the "true" branch: GitHub Actions
+          # treats '' as falsy, which would always fall through to the ||.
+          args: >-
+            release --clean
+            ${{ startsWith(github.ref, 'refs/tags/') && ' ' || '--skip=publish --snapshot' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Verify complete plugin-store archives
+        run: go run ./cmd/checkrelease -dir release
+      - name: Generate plugin-store registry entry
+        run: |
+          jq -n \
+            --arg author "${GITHUB_REPOSITORY%%/*}" \
+            --arg repo "https://github.com/$GITHUB_REPOSITORY" \
+            '{id: "github-copilot", name: "GitHub Copilot", description: "GitHub Copilot device login, strictly account-enabled models, three client protocols, and account management.", author: $author, repository: $repo, homepage: $repo, tags: ["Provider", "OAuth", "GitHub Copilot", "Management"]}' \
+            > release/registry-entry.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plugin-store-release
+          path: |
+            release/*.zip
+            release/checksums.txt
+            release/registry-entry.json
+      - name: Attach registry entry to the draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" release/registry-entry.json

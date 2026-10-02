@@ -1,0 +1,76 @@
+name: Build and verify
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-26.04-arm
+            goos: linux
+            goarch: arm64
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+          - runner: ubuntu-26.04
+            goos: freebsd
+            goarch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify native runner architecture
+        if: matrix.goos != 'freebsd'
+        run: test "$(go env GOOS)/$(go env GOARCH)" = '${{ matrix.goos }}/${{ matrix.goarch }}'
+      - run: make check
+      - name: Verify modules and scan reachable vulnerabilities
+        run: make audit
+      - if: matrix.goos != 'freebsd'
+        run: make build REPOSITORY='https://github.com/${{ github.repository }}'
+      - name: Install FreeBSD cross-compilation tools
+        if: matrix.goos == 'freebsd'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld binutils xz-utils
+      - name: Cross-build FreeBSD AMD64 (no VM)
+        if: matrix.goos == 'freebsd'
+        env:
+          REPOSITORY: https://github.com/${{ github.repository }}
+        run: ./scripts/build-freebsd.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plugin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/**/*.so
+            dist/**/*.dylib
+          if-no-files-found: error
+
+  goreleaser-check:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Validate GitHub workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.18.2
+          args: check

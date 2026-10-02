@@ -1,0 +1,75 @@
+version: 2
+project_name: github-copilot
+# GoReleaser removes this directory before running. The plugin libraries it
+# packages are cgo c-shared builds produced natively per platform in CI (Go
+# cannot cross-compile cgo the way it cross-compiles pure Go), so they live
+# under dist/<goos>/<arch>/ and must survive the clean. Keep goreleaser's own
+# working/output directory separate from that input.
+dist: release
+
+# Importing prebuilt binaries (builder: prebuilt) is a GoReleaser Pro
+# feature. These builds instead compile the inert ./cmd/placeholder package
+# with the plain "go" builder, purely so goreleaser has a real build/archive
+# lifecycle per target, then a post hook overwrites the output with the real
+# cgo c-shared library already built natively for that platform in CI. See
+# scripts/goreleaser-import.sh.
+builds:
+  - id: darwin
+    builder: go
+    main: ./cmd/placeholder
+    env: [CGO_ENABLED=0]
+    goos: [darwin]
+    goarch: [amd64, arm64]
+    binary: github-copilot.dylib
+    hooks:
+      post:
+        - sh scripts/goreleaser-import.sh "{{ .Os }}" "{{ .Arch }}" "{{ .Path }}" dylib
+
+  - id: linux
+    builder: go
+    main: ./cmd/placeholder
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    binary: github-copilot.so
+    hooks:
+      post:
+        - sh scripts/goreleaser-import.sh "{{ .Os }}" "{{ .Arch }}" "{{ .Path }}" so
+
+  - id: freebsd
+    builder: go
+    main: ./cmd/placeholder
+    env: [CGO_ENABLED=0]
+    goos: [freebsd]
+    # Go c-shared builds currently support FreeBSD only on AMD64.
+    goarch: [amd64]
+    binary: github-copilot.so
+    hooks:
+      post:
+        - sh scripts/goreleaser-import.sh "{{ .Os }}" "{{ .Arch }}" "{{ .Path }}" so
+
+archives:
+  - formats: ["zip"]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    wrap_in_directory: false
+    # A non-matching glob prevents GoReleaser from adding default docs.
+    files:
+      - none*
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "SNAPSHOT-{{ .Commit }}"
+
+release:
+  draft: true
+  name_template: "{{ .Tag }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
