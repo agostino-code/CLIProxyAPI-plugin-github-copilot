@@ -1,0 +1,8 @@
+# Force LF line endings regardless of platform or local git config. Windows
+# CI runners default to core.autocrlf=true, which otherwise checks out .go
+# sources as CRLF and makes `gofmt -l` (run by `make check`) fail spuriously.
+* text=auto eol=lf
+
+*.dylib binary
+*.so binary
+*.dll binary

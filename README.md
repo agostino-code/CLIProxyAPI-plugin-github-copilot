@@ -4,7 +4,7 @@
 
 A native Go plugin that connects CLIProxyAPI to GitHub Copilot.
 It runs inside the host, not as a separate HTTP proxy.
-Supported platforms are Linux and macOS on AMD64/ARM64, and FreeBSD on AMD64.
+Supported platforms are Linux and macOS on AMD64/ARM64, FreeBSD on AMD64, and Windows on AMD64.
 
 This is an independent integration, not an official GitHub product.
 Copilot subscriptions, account policies, and usage limits still apply.
@@ -30,7 +30,7 @@ make check
 make build
 ```
 
-A local build produces `dist/<goos>/<goarch>/github-copilot.so`, or `github-copilot.dylib` on macOS.
+A local build produces `dist/<goos>/<goarch>/github-copilot.so`, `github-copilot.dylib` on macOS, or `github-copilot.dll` on Windows.
 The build checks the library's architecture, native format, OS ABI, and exported entrypoint.
 The host and library must match in OS, architecture, and C runtime.
 Linux release builds use Ubuntu 26.04; build on your deployment distribution if you need a different libc baseline, including Alpine/musl.

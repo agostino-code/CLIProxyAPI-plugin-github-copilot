@@ -49,12 +49,28 @@ builds:
         - sh scripts/goreleaser-import.sh "{{ .Os }}" "{{ .Arch }}" "{{ .Path }}" so
 
 archives:
-  - formats: ["zip"]
+  - id: unix
+    ids: [darwin, linux, freebsd]
+    formats: ["zip"]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     wrap_in_directory: false
     # A non-matching glob prevents GoReleaser from adding default docs.
     files:
       - none*
+
+  # Windows has no placeholder build: GoReleaser appends ".exe" to every
+  # Windows binary unless it is a real -buildmode=c-shared build, which needs
+  # cgo and would defeat the placeholder trick above. A meta archive packages
+  # the natively built DLL directly instead. The target is fixed because meta
+  # archives have no per-build .Os/.Arch.
+  - id: windows
+    meta: true
+    formats: ["zip"]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_windows_amd64"
+    wrap_in_directory: false
+    files:
+      - src: dist/windows/amd64/github-copilot.dll
+        strip_parent: true
 
 checksum:
   name_template: "checksums.txt"

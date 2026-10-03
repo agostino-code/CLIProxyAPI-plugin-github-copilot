@@ -14,7 +14,7 @@ import (
 	"strings"
 )
 
-var assetPattern = regexp.MustCompile(`^github-copilot_(.+)_(linux|darwin|freebsd)_(amd64|arm64)\.zip$`)
+var assetPattern = regexp.MustCompile(`^github-copilot_(.+)_(linux|darwin|freebsd|windows)_(amd64|arm64)\.zip$`)
 
 func main() {
 	dir := flag.String("dir", "release", "archive directory")
@@ -23,16 +23,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Println("All five plugin-store ZIPs and SHA-256 checksums verified")
+	fmt.Println("All six plugin-store ZIPs and SHA-256 checksums verified")
 }
 func check(dir string) error {
-	required := map[string]bool{"linux/amd64": false, "linux/arm64": false, "darwin/amd64": false, "darwin/arm64": false, "freebsd/amd64": false}
+	required := map[string]bool{"linux/amd64": false, "linux/arm64": false, "darwin/amd64": false, "darwin/arm64": false, "freebsd/amd64": false, "windows/amd64": false}
 	raw, err := os.ReadFile(filepath.Join(dir, "checksums.txt"))
 	if err != nil {
 		return err
 	}
 	sums := map[string]string{}
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(raw)), "\n") {
 		parts := strings.Fields(line)
 		if len(parts) != 2 || len(parts[0]) != 64 || strings.ContainsAny(parts[1], "/\\") {
 			return errors.New("invalid checksum line")
@@ -93,8 +93,11 @@ func checkZIP(path, goos string) error {
 	}
 	defer reader.Close()
 	library := "github-copilot.so"
-	if goos == "darwin" {
+	switch goos {
+	case "darwin":
 		library = "github-copilot.dylib"
+	case "windows":
+		library = "github-copilot.dll"
 	}
 	seen := map[string]bool{}
 	for _, file := range reader.File {

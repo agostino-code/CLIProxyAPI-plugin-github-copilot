@@ -27,6 +27,9 @@ jobs:
           - runner: ubuntu-26.04
             goos: freebsd
             goarch: amd64
+          - runner: windows-2025
+            goos: windows
+            goarch: amd64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -34,13 +37,21 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Install GNU make
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: choco install make --no-progress -y
       - name: Verify native runner architecture
         if: matrix.goos != 'freebsd'
+        shell: bash
         run: test "$(go env GOOS)/$(go env GOARCH)" = '${{ matrix.goos }}/${{ matrix.goarch }}'
       - run: make check
+        shell: bash
       - name: Verify modules and scan reachable vulnerabilities
+        shell: bash
         run: make audit
       - if: matrix.goos != 'freebsd'
+        shell: bash
         run: make build REPOSITORY='https://github.com/${{ github.repository }}'
       - name: Install FreeBSD cross-compilation tools
         if: matrix.goos == 'freebsd'
@@ -58,6 +69,7 @@ jobs:
           path: |
             dist/**/*.so
             dist/**/*.dylib
+            dist/**/*.dll
           if-no-files-found: error
 
   goreleaser-check:

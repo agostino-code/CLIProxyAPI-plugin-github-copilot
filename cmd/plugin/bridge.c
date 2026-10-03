@@ -1,4 +1,4 @@
-//go:build cgo && (linux || darwin || freebsd)
+//go:build cgo && (linux || darwin || freebsd || windows)
 
 #include "bridge.h"
 #include <string.h>
@@ -7,6 +7,13 @@
 #define ISOLATE_GO_RUNTIMES 1
 #else
 #define ISOLATE_GO_RUNTIMES 0
+#endif
+/* A PE DLL exports nothing by default once any symbol uses dllexport, which
+ * Go's own //export stubs do, so the entry point must opt in explicitly. */
+#if defined(_WIN32)
+#define CLIPROXY_EXPORT __declspec(dllexport)
+#else
+#define CLIPROXY_EXPORT __attribute__((visibility("default")))
 #endif
 
 extern int cliproxyGoInit(void);
@@ -56,7 +63,7 @@ static void plugin_shutdown(void) {
     if (invoke(plugin_shutdown_body, NULL) != 0) abort();
 }
 
-__attribute__((visibility("default")))
+CLIPROXY_EXPORT
 int cliproxy_plugin_init(const cliproxy_host_api* host, cliproxy_plugin_api* plugin) {
     if (!host || !plugin || host->abi_version != 1 || !host->call || !host->free_buffer) return 1;
     host_api = *host;

@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"debug/elf"
 	"debug/macho"
+	"debug/pe"
 	"flag"
 	"fmt"
 	"os"
@@ -21,6 +22,9 @@ import (
 // It is defined in cmd/plugin/bridge.c and must be present and exported.
 const entryPoint = "cliproxy_plugin_init"
 
+// imageFileDLL is the PE COFF characteristics bit marking a DLL.
+const imageFileDLL = 0x2000
+
 // supportedTargets mirrors CLIProxyAPI's plugin platform support: Go
 // c-shared builds work on FreeBSD only for AMD64.
 var supportedTargets = map[string]bool{
@@ -29,11 +33,12 @@ var supportedTargets = map[string]bool{
 	"linux/amd64":   true,
 	"linux/arm64":   true,
 	"freebsd/amd64": true,
+	"windows/amd64": true,
 }
 
 func main() {
 	path := flag.String("path", "", "path to the built plugin library")
-	goos := flag.String("goos", "", "expected GOOS (darwin, linux, or freebsd)")
+	goos := flag.String("goos", "", "expected GOOS (darwin, linux, freebsd, or windows)")
 	goarch := flag.String("goarch", "", "expected GOARCH (amd64 or arm64)")
 	flag.Parse()
 	if *path == "" || *goos == "" || *goarch == "" {
@@ -51,10 +56,25 @@ func validateLibrary(path, goos, arch string) error {
 	if !supportedTargets[goos+"/"+arch] {
 		return fmt.Errorf("unsupported plugin target: %s/%s", goos, arch)
 	}
-	if goos == "linux" || goos == "freebsd" {
+	switch goos {
+	case "linux", "freebsd":
 		return validateELF(path, goos, arch)
+	case "windows":
+		return validatePE(path)
 	}
 	return validateMachO(path, arch)
+}
+
+func validatePE(path string) error {
+	f, err := pe.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if f.Machine != pe.IMAGE_FILE_MACHINE_AMD64 || f.Characteristics&imageFileDLL == 0 {
+		return fmt.Errorf("%s is not an amd64 dynamic-link library", path)
+	}
+	return requireSymbol(path, entryPoint)
 }
 
 func validateELF(path, goos, arch string) error {

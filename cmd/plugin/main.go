@@ -1,4 +1,4 @@
-//go:build cgo && (linux || darwin || freebsd)
+//go:build cgo && (linux || darwin || freebsd || windows)
 
 // The shared library speaks CLIProxyAPI C ABI v1 / JSON schema v6.
 package main

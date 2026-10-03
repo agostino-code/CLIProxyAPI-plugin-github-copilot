@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +26,8 @@ func TestZIPLayout(t *testing.T) {
 		{"valid", []string{"github-copilot.so"}, true},
 		{"empty", nil, false},
 		{"macos", []string{"github-copilot.dylib"}, true},
+		{"windows", []string{"github-copilot.dll"}, true},
+		{"windows-wrong-library", []string{"github-copilot.so"}, false},
 		{"removed-notices", []string{"github-copilot.so", "THIRD_PARTY_NOTICES.txt"}, false},
 		{"nested", []string{"folder/github-copilot.so"}, false},
 		{"extra", []string{"github-copilot.so", "another.so"}, false},
@@ -54,8 +57,11 @@ func TestZIPLayout(t *testing.T) {
 				t.Fatal(err)
 			}
 			goos := "linux"
-			if tc.name == "macos" {
+			switch {
+			case tc.name == "macos":
 				goos = "darwin"
+			case strings.HasPrefix(tc.name, "windows"):
+				goos = "windows"
 			}
 			if err = checkZIP(path, goos); (err == nil) != tc.ok {
 				t.Fatalf("checkZIP=%v want valid=%v", err, tc.ok)
