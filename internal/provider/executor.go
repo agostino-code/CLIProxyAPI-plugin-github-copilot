@@ -18,9 +18,9 @@ import (
 )
 
 const (
-	copilotUserAgent     = "GitHubCopilotChat/0.48.1"
+	copilotUserAgent     = "GitHubCopilotChat/0.67.0"
 	copilotEditorVersion = "vscode/1.139.1"
-	copilotPluginVersion = "copilot-chat/0.48.1"
+	copilotPluginVersion = "copilot-chat/0.67.0"
 	copilotIntegrationID = "vscode-chat"
 	copilotAPIVersion    = "2026-08-01"
 )
