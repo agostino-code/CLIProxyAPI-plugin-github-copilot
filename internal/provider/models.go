@@ -83,7 +83,7 @@ func (s *Service) StaticModels() pluginapi.ModelResponse {
 
 // Model snapshots are isolated by credential generation, not just a reusable host ID.
 func cacheKey(authID string, storage authStorage) string {
-	return authID + "|" + tokenFingerprint(storage.GitHubAccessToken)
+	return authID + "|" + tokenFingerprint(storage.GitHubAccessToken) + "|" + storage.GitHubBaseURL
 }
 
 type modelFlight struct {
@@ -110,6 +110,9 @@ func (s *Service) ModelsForAuth(ctx context.Context, callbackID string, req plug
 func (s *Service) models(ctx context.Context, callbackID, authID string, storage authStorage, force bool) ([]upstreamModel, copilotTokenEntry, error) {
 	if !s.Config().Enabled || s.ctx.Err() != nil {
 		return nil, copilotTokenEntry{}, errors.New("plugin unavailable")
+	}
+	if err := s.Config().validateStorageOrigin(storage); err != nil {
+		return nil, copilotTokenEntry{}, err
 	}
 	key := cacheKey(authID, storage)
 	now := s.now()

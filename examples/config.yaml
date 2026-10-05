@@ -21,3 +21,12 @@ plugins:
       oauth_timeout_seconds: 900
       model_cache_ttl_seconds: 60 # 30-60 seconds, never stale fallback.
       token_expiry_buffer_seconds: 300
+
+# GHE.com alternative: replace the three public endpoints above with these.
+# Use a client ID approved for device flow on your tenant (not a client secret).
+# github_base_url: https://example.ghe.com
+# github_api_url: https://api.example.ghe.com
+# copilot_api_url: https://copilot-api.example.ghe.com
+# github_client_id: YOUR_TENANT_DEVICE_FLOW_CLIENT_ID
+# The two API URLs may be omitted for tenant-derived defaults.
+# Do not combine a tenant base URL with explicit public API overrides.

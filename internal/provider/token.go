@@ -38,8 +38,11 @@ type tokenFlight struct {
 }
 
 func (s *Service) copilotToken(ctx context.Context, callbackID, authID string, storage authStorage) (copilotTokenEntry, error) {
-	key := cacheKey(authID, storage)
 	cfg := s.Config()
+	if err := cfg.validateStorageOrigin(storage); err != nil {
+		return copilotTokenEntry{}, err
+	}
+	key := cacheKey(authID, storage)
 	now := s.now()
 	s.tokenMu.Lock()
 	if retry := s.tokenRetries[key]; now.Before(retry) {
@@ -183,10 +186,16 @@ func copilotAPIBase(endpoints map[string]string, cfg Config) (string, error) {
 	if parsed.Scheme != "https" && !(cfg.AllowInsecureBaseURLs && parsed.Scheme == "http") {
 		return "", fmt.Errorf("copilot API endpoint must use HTTPS")
 	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if parsed.User != nil || parsed.ForceQuery || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", fmt.Errorf("copilot API endpoint contains query or fragment")
 	}
 	configured, _ := url.Parse(cfg.CopilotAPIURL)
+	if cfg.enterpriseHost() != "" {
+		if parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, configured.Host) || parsed.Path != configured.Path {
+			return "", errors.New("copilot API endpoint does not match configured GHE.com origin")
+		}
+		return raw, nil
+	}
 	host := strings.ToLower(parsed.Hostname())
 	if parsed.Scheme != configured.Scheme || parsed.Host != configured.Host {
 		if parsed.Scheme != "https" || parsed.Port() != "" || !(host == "api.githubcopilot.com" || strings.HasSuffix(host, ".githubcopilot.com")) {

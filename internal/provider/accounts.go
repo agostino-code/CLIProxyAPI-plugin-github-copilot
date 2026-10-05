@@ -1,14 +1,10 @@
 package provider
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -16,7 +12,11 @@ import (
 	"cliproxyapi-github-copilot/internal/transport"
 )
 
+// CatalogRevisionKey is retained to preserve metadata from older credentials.
+// Catalog refreshes must never write this marker back to a host auth file.
 const CatalogRevisionKey = "github_copilot_catalog_revision"
+
+const hostCatalogSyncUnavailable = "automatic host model registry refresh unavailable; registry may remain stale until the host requests models again; local catalog enforcement remains active"
 
 type AccountStatus struct {
 	ID             string    `json:"id"`
@@ -40,16 +40,23 @@ func (s *Service) Status() any {
 	}
 	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
 	return struct {
-		Configured bool            `json:"configured"`
-		Accounts   []AccountStatus `json:"accounts"`
-		Error      string          `json:"error,omitempty"`
-		TTL        int             `json:"catalog_ttl_seconds"`
-	}{true, accounts, s.syncError, s.Config().ModelCacheTTLSeconds}
+		Configured    bool            `json:"configured"`
+		Accounts      []AccountStatus `json:"accounts"`
+		Error         string          `json:"error,omitempty"`
+		TTL           int             `json:"catalog_ttl_seconds"`
+		GitHubBaseURL string          `json:"github_base_url"`
+	}{true, accounts, s.syncError, s.Config().ModelCacheTTLSeconds, s.Config().GitHubBaseURL}
 }
 
-// SyncAccounts uses only host-owned auth records. It never scans the filesystem.
-// A revision marker changes the host watcher's semantic auth snapshot and causes
-// model.for_auth to replace (including clear) that account's registry entries.
+// SyncAccounts reads host-owned auth records and refreshes local model catalogs.
+// It never scans the filesystem or writes credentials. The v8.0.15 host only
+// provides an unconditional whole-document save, so even a read-compare-save can
+// overwrite a token rotation, disable operation, or other concurrent edit.
+//
+// Until the host provides an atomic metadata patch or explicit registry refresh,
+// background discovery cannot notify its model registry of catalog changes. The
+// registry may remain stale until the host next invokes model.for_auth. Local
+// catalog refreshes and request-time eligibility checks still fail closed.
 func (s *Service) SyncAccounts(ctx context.Context, force bool) error {
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
@@ -67,6 +74,7 @@ func (s *Service) SyncAccounts(ctx context.Context, force bool) error {
 		return errors.New("cannot enumerate host credentials")
 	}
 	live := map[string]bool{}
+	generations := map[string]bool{}
 	for _, file := range list.Files {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -76,7 +84,6 @@ func (s *Service) SyncAccounts(ctx context.Context, force bool) error {
 		}
 		live[file.ID] = true
 		var record struct {
-			Name string          `json:"name"`
 			JSON json.RawMessage `json:"json"`
 		}
 		selector := map[string]string{"auth_index": file.AuthIndex}
@@ -92,6 +99,7 @@ func (s *Service) SyncAccounts(ctx context.Context, force bool) error {
 		models, token, discoveryErr := s.models(ctx, "", file.ID, storage, force)
 		status := AccountStatus{ID: file.ID, Login: storage.GitHubLogin, Models: []string{}, TokenExpiresAt: token.ExpiresAt}
 		key := cacheKey(file.ID, storage)
+		generations[key] = true
 		s.modelMu.Lock()
 		entry := s.modelEntries[key]
 		s.modelMu.Unlock()
@@ -111,30 +119,7 @@ func (s *Service) SyncAccounts(ctx context.Context, force bool) error {
 		for _, model := range infos {
 			status.Models = append(status.Models, model.ID)
 		}
-		encoded, _ := json.Marshal(infos)
-		hash := sha256.Sum256(encoded)
-		revision := hex.EncodeToString(hash[:])
-		var fields map[string]json.RawMessage
-		_ = json.Unmarshal(record.JSON, &fields)
-		var previous string
-		_ = json.Unmarshal(fields[CatalogRevisionKey], &previous)
-		if previous != revision {
-			// Read again immediately before saving. Never overwrite an observed
-			// external edit or token rotation with a previously fetched document.
-			var latest struct {
-				JSON json.RawMessage `json:"json"`
-			}
-			var runtimeInfo pluginapi.HostAuthGetRuntimeResponse
-			if rpc.Call("host.auth.get_runtime", selector, &runtimeInfo) != nil || runtimeInfo.Auth.Disabled || rpc.Call("host.auth.get", selector, &latest) != nil || !bytes.Equal(latest.JSON, record.JSON) {
-				status.SyncError = "credential changed during discovery; retry pending"
-			} else {
-				fields[CatalogRevisionKey], _ = json.Marshal(revision)
-				updated, _ := json.Marshal(fields)
-				if rpc.Call("host.auth.save", pluginapi.HostAuthSaveRequest{Name: record.Name, JSON: updated}, nil) != nil {
-					status.SyncError = "host catalog synchronization failed"
-				}
-			}
-		}
+		status.SyncError = hostCatalogSyncUnavailable
 		s.setAccount(status)
 	}
 	s.accountsMu.Lock()
@@ -146,7 +131,7 @@ func (s *Service) SyncAccounts(ctx context.Context, force bool) error {
 		}
 	}
 	s.accountsMu.Unlock()
-	s.purgeMissing(live)
+	s.purgeMissing(generations)
 	// Bound device-flow state even when a client abandons polling.
 	s.oauthMu.Lock()
 	for id, session := range s.oauthSession {
@@ -163,15 +148,26 @@ func (s *Service) setAccount(status AccountStatus) {
 	s.accountsMu.Unlock()
 }
 
-// Purge caches for generations no longer referenced by the host, including
-// credentials that never reached the management snapshot.
-func (s *Service) purgeMissing(live map[string]bool) {
+// Purge token, retry and catalog entries for credential generations no longer
+// referenced by the host. External token rotations do not call invalidateAuth.
+func (s *Service) purgeMissing(generations map[string]bool) {
 	s.modelMu.Lock()
 	for key := range s.modelEntries {
-		id, _, _ := strings.Cut(key, "|")
-		if !live[id] {
+		if !generations[key] {
 			delete(s.modelEntries, key)
 		}
 	}
 	s.modelMu.Unlock()
+	s.tokenMu.Lock()
+	for key := range s.tokenEntries {
+		if !generations[key] {
+			delete(s.tokenEntries, key)
+		}
+	}
+	for key := range s.tokenRetries {
+		if !generations[key] {
+			delete(s.tokenRetries, key)
+		}
+	}
+	s.tokenMu.Unlock()
 }

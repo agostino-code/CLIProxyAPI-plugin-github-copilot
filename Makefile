@@ -25,8 +25,8 @@ check:
 	$(GO) test -race -timeout 90s -count=1 ./...
 
 integration: build
-	@test -n "$(CPA_BINARY)" || (echo 'Set CPA_BINARY to a plugin-enabled CLIProxyAPI >= 8.0.12 binary'; exit 1)
-	CPA_BINARY='$(CPA_BINARY)' CPA_PLUGIN_PATH='$(CURDIR)/$(LIBRARY)' $(GO) test -v -timeout 3m -count=1 ./integration
+	@test -n "$(CPA_BINARY)" || (echo 'Set CPA_BINARY to a plugin-enabled CLIProxyAPI binary; CI tests v8.0.15'; exit 1)
+	CPA_REQUIRE_NATIVE=1 CPA_BINARY='$(CPA_BINARY)' CPA_PLUGIN_PATH='$(CURDIR)/$(LIBRARY)' $(GO) test -v -timeout 3m -count=1 ./integration
 
 # Assembles whatever dist/<goos>/<arch>/ libraries already exist into
 # store-ready ZIPs and checksums, without publishing anything. A full,

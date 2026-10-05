@@ -23,6 +23,9 @@ import (
 func TestNativePlugin(t *testing.T) {
 	binary, library := os.Getenv("CPA_BINARY"), os.Getenv("CPA_PLUGIN_PATH")
 	if binary == "" || library == "" {
+		if os.Getenv("CPA_REQUIRE_NATIVE") == "1" {
+			t.Fatal("native integration is required: set CPA_BINARY and CPA_PLUGIN_PATH")
+		}
 		t.Skip("set CPA_BINARY and CPA_PLUGIN_PATH")
 	}
 	id := os.Getenv("CPA_PLUGIN_ID")
@@ -101,6 +104,10 @@ func TestNativePlugin(t *testing.T) {
 			}
 			if req["stream"] == true {
 				w.Header().Set("Content-Type", "text/event-stream")
+				if bytes.Contains(raw, []byte("stream-error-body")) {
+					fmt.Fprint(w, "event: error\ndata: {\"message\":\"secret-must-not-leak\"}\n\n")
+					return
+				}
 				if bytes.Contains(raw, []byte("truncate-stream")) {
 					fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\"}\n\n")
 					return
@@ -108,7 +115,7 @@ func TestNativePlugin(t *testing.T) {
 				var body string
 				switch r.URL.Path {
 				case "/chat/completions":
-					body = "data: {\"id\":\"chat_1\",\"object\":\"chat.completion.chunk\",\"model\":\"account-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+					body = "data: {\"id\":\"chat_1\",\"object\":\"chat.completion.chunk\",\"model\":\"account-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chat_1\",\"object\":\"chat.completion.chunk\",\"model\":\"account-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
 				case "/v1/messages":
 					body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"account-model\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 				default:
@@ -136,7 +143,7 @@ func TestNativePlugin(t *testing.T) {
 			w.WriteHeader(404)
 		}
 	}))
-	defer upstream.Close()
+	t.Cleanup(upstream.Close)
 	temp := t.TempDir()
 	authdir := filepath.Join(temp, "auth")
 	plugins := filepath.Join(temp, "plugins", runtime.GOOS, runtime.GOARCH)
@@ -152,10 +159,13 @@ func TestNativePlugin(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(authPath, []byte(`{"type":"copilot","github_access_token":"mock-github-token","github_login":"test","note":"preserve-me","custom":{"nested":true}}`))
+	originalAuth := []byte(`{"type":"copilot","github_access_token":"mock-github-token","github_login":"test","note":"preserve-me","custom":{"nested":true}}`)
+	write(authPath, originalAuth)
 	ext := ".so"
 	if runtime.GOOS == "darwin" {
 		ext = ".dylib"
+	} else if runtime.GOOS == "windows" {
+		ext = ".dll"
 	}
 	initialLibrary := library
 	if old := os.Getenv("CPA_UPGRADE_FROM"); old != "" {
@@ -387,6 +397,9 @@ func TestNativePlugin(t *testing.T) {
 				if code != 200 || !bytes.Contains(b, []byte("OK")) {
 					t.Fatalf("%s stream=%v: %d %s", route, stream, code, b)
 				}
+				if stream {
+					assertStreamFraming(t, route, b)
+				}
 			}
 		}
 	})
@@ -422,6 +435,9 @@ func TestNativePlugin(t *testing.T) {
 				if code != 200 || !bytes.Contains(b, []byte("OK")) {
 					t.Fatalf("cross protocol %s stream=%v: %d %s", route, stream, code, b)
 				}
+				if stream {
+					assertStreamFraming(t, route, b)
+				}
 			}
 		}
 	})
@@ -454,6 +470,13 @@ func TestNativePlugin(t *testing.T) {
 		_, b = request("POST", "/v1/responses", "client-test-key", map[string]any{"model": "copilot/account-model", "input": "truncate-stream", "stream": true})
 		if !bytes.Contains(b, []byte("error")) {
 			t.Fatalf("truncation accepted: %s", b)
+		}
+		for _, route := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+			body := map[string]any{"model": "copilot/account-model", "input": "stream-error-body", "stream": true, "max_tokens": 32, "messages": []any{map[string]string{"role": "user", "content": "stream-error-body"}}}
+			_, b = request("POST", route, "client-test-key", body)
+			if !bytes.Contains(b, []byte("error")) || bytes.Contains(b, []byte("secret-must-not-leak")) {
+				t.Fatalf("unsafe stream error %s: %s", route, b)
+			}
 		}
 	})
 	t.Run("management protection", func(t *testing.T) {
@@ -534,12 +557,42 @@ func TestNativePlugin(t *testing.T) {
 		<-done
 	})
 
+	localCatalogHas := func(t *testing.T, model string) bool {
+		t.Helper()
+		code, body := request("GET", "/v0/management/plugins/"+id+"/status", "management-test-key", nil)
+		var status struct {
+			Accounts []struct {
+				Models    []string `json:"models"`
+				SyncError string   `json:"sync_error"`
+			} `json:"accounts"`
+		}
+		if code != 200 || json.Unmarshal(body, &status) != nil || len(status.Accounts) == 0 {
+			t.Fatalf("account status unavailable: %d %s", code, body)
+		}
+		found := false
+		for _, account := range status.Accounts {
+			if account.SyncError == "" {
+				t.Fatal("host registry limitation must be visible")
+			}
+			for _, current := range account.Models {
+				if current == model {
+					found = true
+				}
+			}
+		}
+		return found
+	}
 	t.Run("disable and reenable", func(t *testing.T) {
+		// The host may normalize auth files during ordinary startup/inference.
+		// Compare the file around the catalog-only operation under test.
+		beforeAuth, err := os.ReadFile(authPath)
+		if err != nil {
+			t.Fatal(err)
+		}
 		disabled.Store(true)
 		refresh(t)
 		await(t, func() bool {
-			_, b := request("GET", "/v1/models", "client-test-key", nil)
-			return !bytes.Contains(b, []byte("account-model"))
+			return !localCatalogHas(t, "copilot/account-model")
 		})
 		before := calls.Load()
 		code, _ := request("POST", "/v1/responses", "client-test-key", map[string]any{"model": "copilot/account-model", "input": "OK"})
@@ -549,29 +602,34 @@ func TestNativePlugin(t *testing.T) {
 		disabled.Store(false)
 		refresh(t)
 		await(t, func() bool {
-			_, b := request("GET", "/v1/models", "client-test-key", nil)
-			return bytes.Contains(b, []byte("account-model"))
+			return localCatalogHas(t, "copilot/account-model")
 		})
 		raw, err := os.ReadFile(authPath)
 		if err != nil {
 			t.Fatal(err)
 		}
+		if !bytes.Equal(raw, beforeAuth) {
+			t.Fatal("catalog refresh changed the host-owned credential")
+		}
 		if !bytes.Contains(raw, []byte("preserve-me")) || !bytes.Contains(raw, []byte(`"nested":true`)) {
-			t.Fatalf("credential metadata lost: %s", raw)
+			t.Fatal("credential metadata was lost")
 		}
 	})
-	t.Run("discovery failure clears listing", func(t *testing.T) {
+	t.Run("discovery failure clears local eligibility", func(t *testing.T) {
 		outage.Store(true)
 		refresh(t)
 		await(t, func() bool {
-			_, b := request("GET", "/v1/models", "client-test-key", nil)
-			return !bytes.Contains(b, []byte("account-model"))
+			return !localCatalogHas(t, "copilot/account-model")
 		})
+		before := calls.Load()
+		code, _ := request("POST", "/v1/responses", "client-test-key", map[string]any{"model": "copilot/account-model", "input": "OK"})
+		if code == 200 || calls.Load() != before {
+			t.Fatal("unavailable catalog allowed inference")
+		}
 		outage.Store(false)
 		refresh(t)
 		await(t, func() bool {
-			_, b := request("GET", "/v1/models", "client-test-key", nil)
-			return bytes.Contains(b, []byte("account-model"))
+			return localCatalogHas(t, "copilot/account-model")
 		})
 	})
 	t.Run("GitHub device login", func(t *testing.T) {
@@ -588,24 +646,36 @@ func TestNativePlugin(t *testing.T) {
 			_, b := request("GET", "/v0/management/get-auth-status?state="+started.State, "management-test-key", nil)
 			return bytes.Contains(b, []byte(`"status":"ok"`))
 		})
-		raw, err := os.ReadFile(filepath.Join(authdir, "copilot-new-account.json"))
-		if err != nil || !bytes.Contains(raw, []byte("mock-github-token-new")) {
-			t.Fatalf("login not persisted: %v", err)
+		files, err := filepath.Glob(filepath.Join(authdir, "copilot-new-account*.json"))
+		if err != nil || len(files) != 1 {
+			t.Fatalf("login file missing: %v", err)
+		}
+		raw, err := os.ReadFile(files[0])
+		var stored struct {
+			Token  string `json:"github_access_token"`
+			Issuer string `json:"github_base_url"`
+		}
+		if err != nil || json.Unmarshal(raw, &stored) != nil || stored.Token != "mock-github-token-new" || stored.Issuer != upstream.URL {
+			t.Fatalf("issuer-scoped login not persisted: %v", err)
 		}
 	})
 
-	t.Run("background refresh withdraws disabled model", func(t *testing.T) {
+	t.Run("background refresh blocks disabled model locally", func(t *testing.T) {
 		disabled.Store(true)
 		deadline := time.Now().Add(45 * time.Second)
 		for {
-			_, b := request("GET", "/v1/models", "client-test-key", nil)
-			if !bytes.Contains(b, []byte("account-model")) {
+			if !localCatalogHas(t, "copilot/account-model") {
 				break
 			}
 			if time.Now().After(deadline) {
-				t.Fatal("background catalog expiry did not withdraw model")
+				t.Fatal("background catalog expiry did not remove local eligibility")
 			}
 			time.Sleep(200 * time.Millisecond)
+		}
+		before := calls.Load()
+		code, _ := request("POST", "/v1/responses", "client-test-key", map[string]any{"model": "copilot/account-model", "input": "OK"})
+		if code == 200 || calls.Load() != before {
+			t.Fatal("background-disabled model reached upstream")
 		}
 		disabled.Store(false)
 		refresh(t)

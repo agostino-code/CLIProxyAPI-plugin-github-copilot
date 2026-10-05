@@ -149,7 +149,20 @@ func (s *Service) StartLogin(ctx context.Context, callbackID string) (pluginapi.
 		Interval:   time.Duration(device.Interval) * time.Second,
 		NextPoll:   now,
 	}
+	if err := validateBaseURL(device.VerificationURI, cfg.AllowInsecureBaseURLs); err != nil {
+		return pluginapi.AuthLoginStartResponse{}, statusError("invalid_verification_url", "invalid GitHub verification URL", 502)
+	}
+	verification, _ := url.Parse(device.VerificationURI)
+	base, _ := url.Parse(cfg.GitHubBaseURL)
+	if verification.Scheme != base.Scheme || !strings.EqualFold(verification.Host, base.Host) {
+		return pluginapi.AuthLoginStartResponse{}, statusError("invalid_verification_url", "untrusted GitHub verification URL", 502)
+	}
 	s.oauthMu.Lock()
+	for key, existing := range s.oauthSession {
+		if !now.Before(existing.ExpiresAt) && !existing.Polling {
+			delete(s.oauthSession, key)
+		}
+	}
 	if len(s.oauthSession) >= 64 {
 		s.oauthMu.Unlock()
 		return pluginapi.AuthLoginStartResponse{}, statusError("too_many_logins", "too many pending device logins", 429)
@@ -157,14 +170,6 @@ func (s *Service) StartLogin(ctx context.Context, callbackID string) (pluginapi.
 	s.oauthSession[state] = session
 	s.oauthMu.Unlock()
 
-	if err := validateBaseURL(device.VerificationURI, cfg.AllowInsecureBaseURLs); err != nil {
-		return pluginapi.AuthLoginStartResponse{}, statusError("invalid_verification_url", "invalid GitHub verification URL", 502)
-	}
-	verification, _ := url.Parse(device.VerificationURI)
-	base, _ := url.Parse(cfg.GitHubBaseURL)
-	if verification.Host != base.Host {
-		return pluginapi.AuthLoginStartResponse{}, statusError("invalid_verification_url", "untrusted GitHub verification URL", 502)
-	}
 	loginURL := "" // Build from the verified URI, not an untrusted complete URL.
 	if loginURL == "" {
 		parsed, errParse := url.Parse(device.VerificationURI)
@@ -255,6 +260,7 @@ func (s *Service) PollLogin(ctx context.Context, callbackID, state string) (plug
 	createdAt := s.now()
 	storage := authStorage{
 		Type:               providerID,
+		GitHubBaseURL:      cfg.GitHubBaseURL,
 		GitHubAccessToken:  strings.TrimSpace(token.AccessToken),
 		GitHubRefreshToken: strings.TrimSpace(token.RefreshToken),
 		TokenType:          strings.TrimSpace(token.TokenType),
@@ -371,6 +377,9 @@ func (s *Service) RefreshAuth(ctx context.Context, callbackID string, req plugin
 	storage, errParse := parseStorage(req.StorageJSON)
 	if errParse != nil {
 		return pluginapi.AuthRefreshResponse{}, errParse
+	}
+	if err := s.Config().validateStorageOrigin(storage); err != nil {
+		return pluginapi.AuthRefreshResponse{}, err
 	}
 	now := s.now()
 	if storage.ExpiresAt == 0 || time.Unix(storage.ExpiresAt, 0).After(now.Add(10*time.Minute)) {
