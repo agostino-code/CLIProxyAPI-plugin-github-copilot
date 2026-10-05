@@ -39,9 +39,14 @@ func TestLifecycle(t *testing.T) {
 		t.Fatal("unchanged reload discarded runtime")
 	}
 	req.ConfigYAML = []byte("model_cache_ttl_seconds: 9999")
-	dispatch(t, p, "plugin.reconfigure", req)
-	if p.service != nil || old.Context().Err() == nil {
-		t.Fatal("invalid reconfigure did not fail closed")
+	out = dispatch(t, p, "plugin.reconfigure", req)
+	if string(out["ok"]) != "false" || p.service != old || old.Context().Err() != nil {
+		t.Fatal("invalid reconfigure did not preserve the working service and report failure")
+	}
+	req.ConfigYAML = []byte("enabled: false")
+	out = dispatch(t, p, "plugin.reconfigure", req)
+	if string(out["ok"]) != "true" || p.service != nil || old.Context().Err() == nil {
+		t.Fatal("valid disabled config did not stop the service")
 	}
 	out = dispatch(t, p, "model.static", nil)
 	if !strings.Contains(string(out["result"]), `"Models":[]`) {
@@ -89,6 +94,12 @@ func TestMetadataContract(t *testing.T) {
 	}
 	if _, exists := fields["excluded_model_prefixes"]; exists {
 		t.Fatal("obsolete model exclusion configuration exposed")
+	}
+	for _, name := range []string{"allow_insecure_base_urls", "allow_custom_endpoints", "allow_custom_scopes"} {
+		field := fields[name]
+		if field.Type != pluginapi.ConfigFieldTypeBoolean || !strings.Contains(field.Description, "Opt in") || !strings.Contains(field.Description, "disabled by default") || !strings.Contains(field.Description, "restart") {
+			t.Errorf("%s is missing an explicit boolean opt-in and restart warning", name)
+		}
 	}
 
 	if r.SchemaVersion != 6 || r.Metadata.Author == "" || r.Metadata.GitHubRepository == "" {

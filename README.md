@@ -61,7 +61,8 @@ Supply an existing plugin-enabled CLIProxyAPI binary matching your platform:
 make integration CPA_BINARY=/absolute/path/to/cli-proxy-api
 ```
 
-CI runs build, unit, and native host integration checks. The native job uses the unmodified v8.0.15 host pinned to commit `a4acc9f752bd46571f737a10c04bf413656ab06b`.
+CI and release packaging both require native host integration checks against the same source commit.
+CI also runs build and unit checks. The native job uses the unmodified v8.0.15 host pinned to commit `a4acc9f752bd46571f737a10c04bf413656ab06b`.
 The integration target fails if `CPA_BINARY` or the built plugin is missing.
 Tests use an isolated host, mock GitHub/Copilot endpoints, and temporary credentials, not your existing deployment or account.
 Additional dependency checks are available through `make audit`.
@@ -145,7 +146,9 @@ A multi-account host may list a combined catalog, but each request is checked ag
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `github_client_id` | `Iv1.b507a08c87ecfe98` | Public GitHub device-flow client ID |
-| `github_scope` | `read:user` | GitHub authorization scope |
+| `github_scope` | `read:user` | GitHub authorization scope; a broader scope needs explicit opt-in |
+| `allow_custom_scopes` | `false` | Permit an operator-selected scope beyond `read:user` |
+| `allow_custom_endpoints` | `false` | Trust custom non-GHE.com HTTPS endpoints; grants them access to the configured credentials and prompts |
 | `oauth_timeout_seconds` | `900` | Device-login timeout, from 60 to 1800 seconds |
 | `token_expiry_buffer_seconds` | `300` | Token renewal buffer, from 30 to 900 seconds |
 
@@ -186,8 +189,15 @@ Normal OAuth refresh still returns updated credentials through the host's dedica
 
 ### Security and API limits
 
+By default, public GitHub mode accepts only `github.com` for OAuth, `api.github.com` for REST, and HTTPS `*.githubcopilot.com` origins for Copilot.
+Other non-GHE.com HTTPS endpoints require `allow_custom_endpoints: true`; this explicitly trusts those destinations with legacy unbound credentials and request data.
+This flag never relaxes GHE.com tenant isolation, HTTPS, userinfo, or query/fragment checks.
 Endpoint overrides are trusted operator settings, not values to accept from user prompts.
-HTTPS is required; `allow_insecure_base_urls` permits loopback HTTP only for tests.
+HTTPS is required; `allow_insecure_base_urls` explicitly permits loopback test endpoints, including HTTP.
+Authentication destinations, client ID, scope, and trust flags cannot change through reconfiguration, including a disable/re-enable cycle; restart the plugin to apply those changes.
+Invalid configuration returns a native lifecycle error without replacing the existing service. An explicit `enabled: false` remains a successful disable when routing is unchanged.
+The host may save a management config edit before applying it, so an HTTP success from that edit is not proof of successful plugin reconfiguration.
+Check host plugin status/logs after edits; restore the last accepted configuration or restart with the intended routing if the host withdraws the failed registration.
 HTTP requests use the host's supported HTTP callbacks and global proxy behavior. The plugin does not create a separate HTTP transport.
 The v8.0.15 native HTTP callback bridge does not expose per-account/request proxy overrides to this plugin; do not rely on those overrides for isolation.
 The v8.0.15 plugin API does not expose redirect control or the final response URL. Initial-origin checks cannot constrain later redirects followed by the host.
@@ -201,4 +211,6 @@ Same-protocol requests preserve native fields; cross-protocol conversion cannot 
 Claude token counting is a local estimate, not an authoritative Anthropic count.
 Embeddings, completion-only models, and generic HTTP forwarding are not supported.
 Incomplete streams fail, and delivered streams are never replayed by the plugin.
+Streams are limited to 2 minutes without upstream activity and 30 minutes total, including the wait for first headers.
+A valid terminal event closes the upstream immediately; Chat Completions requires a finish reason before `[DONE]`.
 Set host `request-retry: 0` if you also need to disable host-level retries.

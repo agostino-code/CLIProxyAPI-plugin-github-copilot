@@ -73,7 +73,7 @@ func (s *Service) Configure(raw []byte) error {
 		return err
 	}
 	s.configMu.Lock()
-	if s.configured && !s.config.sameAuthRouting(cfg) {
+	if s.configured && !s.config.SameAuthRouting(cfg) {
 		s.configMu.Unlock()
 		return errors.New("authentication endpoint changes require a plugin restart")
 	}

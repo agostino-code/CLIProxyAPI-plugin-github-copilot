@@ -30,6 +30,8 @@ type Config struct {
 	GitHubBaseURL            string        `yaml:"github_base_url"`
 	GitHubAPIURL             string        `yaml:"github_api_url"`
 	CopilotAPIURL            string        `yaml:"copilot_api_url"`
+	AllowCustomEndpoints     bool          `yaml:"allow_custom_endpoints"`
+	AllowCustomScopes        bool          `yaml:"allow_custom_scopes"`
 	AllowInsecureBaseURLs    bool          `yaml:"allow_insecure_base_urls"`
 	OAuthTimeoutSeconds      int           `yaml:"oauth_timeout_seconds"`
 	ModelCacheTTLSeconds     int           `yaml:"model_cache_ttl_seconds"`
@@ -84,7 +86,10 @@ func ParseConfig(raw []byte) (Config, error) {
 		seen[model.Alias] = true
 	}
 	cfg.GitHubClientID = strings.TrimSpace(cfg.GitHubClientID)
-	cfg.GitHubScope = strings.TrimSpace(cfg.GitHubScope)
+	cfg.GitHubScope = strings.Join(strings.Fields(cfg.GitHubScope), " ")
+	if !cfg.AllowCustomScopes && cfg.GitHubScope != "" && cfg.GitHubScope != "read:user" {
+		return Config{}, fmt.Errorf("github_scope beyond read:user requires allow_custom_scopes: true")
+	}
 	cfg.GitHubBaseURL = strings.TrimRight(strings.TrimSpace(cfg.GitHubBaseURL), "/")
 	cfg.GitHubAPIURL = strings.TrimRight(strings.TrimSpace(cfg.GitHubAPIURL), "/")
 	cfg.CopilotAPIURL = strings.TrimRight(strings.TrimSpace(cfg.CopilotAPIURL), "/")
@@ -104,6 +109,9 @@ func ParseConfig(raw []byte) (Config, error) {
 		if errURL := validateBaseURL(value, cfg.AllowInsecureBaseURLs); errURL != nil {
 			return Config{}, fmt.Errorf("%s: %w", name, errURL)
 		}
+	}
+	if err := cfg.validateEndpointTrust(); err != nil {
+		return Config{}, err
 	}
 	if cfg.OAuthTimeoutSeconds < 60 || cfg.OAuthTimeoutSeconds > 1800 {
 		return Config{}, fmt.Errorf("oauth_timeout_seconds must be between 60 and 1800")
@@ -223,8 +231,42 @@ func (c *Config) configureEnterprise(supplied map[string]any) error {
 	return nil
 }
 
-// Endpoint changes require a new service: in-flight grants and credentials must
-// never be routed to a different tenant during a configuration reload.
-func (c Config) sameAuthRouting(other Config) bool {
-	return c.GitHubBaseURL == other.GitHubBaseURL && c.GitHubAPIURL == other.GitHubAPIURL && c.CopilotAPIURL == other.CopilotAPIURL && c.GitHubClientID == other.GitHubClientID && c.AllowInsecureBaseURLs == other.AllowInsecureBaseURLs
+// SameAuthRouting reports whether a reconfiguration preserves all authentication
+// destinations and trust settings. The plugin lifecycle checks this before
+// replacing a service, including across a disable/re-enable cycle.
+func (c Config) SameAuthRouting(other Config) bool {
+	return c.GitHubBaseURL == other.GitHubBaseURL && c.GitHubAPIURL == other.GitHubAPIURL && c.CopilotAPIURL == other.CopilotAPIURL && c.GitHubClientID == other.GitHubClientID && c.GitHubScope == other.GitHubScope && c.AllowInsecureBaseURLs == other.AllowInsecureBaseURLs && c.AllowCustomEndpoints == other.AllowCustomEndpoints && c.AllowCustomScopes == other.AllowCustomScopes
+}
+
+func (c Config) validateEndpointTrust() error {
+	// Enterprise configuration has its own stronger same-tenant restrictions;
+	// neither custom-endpoint nor loopback flags can relax those restrictions.
+	if c.enterpriseHost() != "" || c.AllowCustomEndpoints {
+		return nil
+	}
+	for name, raw := range map[string]string{"github_base_url": c.GitHubBaseURL, "github_api_url": c.GitHubAPIURL, "copilot_api_url": c.CopilotAPIURL} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("%s: invalid URL", name)
+		}
+		host := strings.ToLower(u.Hostname())
+		if c.AllowInsecureBaseURLs && (host == "localhost" || host == "127.0.0.1" || host == "::1") {
+			continue
+		}
+		allowed := false
+		if u.Scheme == "https" && u.Port() == "" && u.Path == "" && u.RawPath == "" {
+			switch name {
+			case "github_base_url":
+				allowed = host == "github.com"
+			case "github_api_url":
+				allowed = host == "api.github.com"
+			case "copilot_api_url":
+				allowed = host == "api.githubcopilot.com" || strings.HasSuffix(host, ".githubcopilot.com")
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("%s uses a custom endpoint; explicitly enable allow_custom_endpoints to trust it", name)
+		}
+	}
+	return nil
 }

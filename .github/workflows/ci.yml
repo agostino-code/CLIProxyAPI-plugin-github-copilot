@@ -92,29 +92,4 @@ jobs:
           args: check
 
   native-integration:
-    runs-on: ubuntu-26.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Check out unmodified CLIProxyAPI v8.0.15
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: router-for-me/CLIProxyAPI
-          ref: a4acc9f752bd46571f737a10c04bf413656ab06b
-          path: .host-ci
-          persist-credentials: false
-      - name: Build the pinned plugin-enabled host
-        working-directory: .host-ci
-        env:
-          CGO_ENABLED: "1"
-        run: |
-          test "$(git rev-parse HEAD)" = a4acc9f752bd46571f737a10c04bf413656ab06b
-          go build -trimpath -buildvcs=false -o "$RUNNER_TEMP/cli-proxy-api" ./cmd/server
-      - name: Verify native ABI and client wire protocols
-        run: make integration CPA_BINARY="$RUNNER_TEMP/cli-proxy-api" REPOSITORY="https://github.com/$GITHUB_REPOSITORY"
+    uses: ./.github/workflows/native-integration.yml

@@ -38,6 +38,7 @@ func TestNativePlugin(t *testing.T) {
 	var rejectOnce atomic.Bool
 	slowStarted := make(chan struct{}, 1)
 	slowCanceled := make(chan struct{}, 1)
+	terminalCanceled := make(chan struct{}, 1)
 	var toolResult atomic.Bool
 	var upstream *httptest.Server
 	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -124,6 +125,14 @@ func TestNativePlugin(t *testing.T) {
 				for i := 0; i < len(body); i += 7 {
 					_, _ = io.WriteString(w, body[i:min(i+7, len(body))])
 					w.(http.Flusher).Flush()
+				}
+				if bytes.Contains(raw, []byte("hold-after-terminal")) {
+					select {
+					case <-r.Context().Done():
+						terminalCanceled <- struct{}{}
+					case <-time.After(5 * time.Second):
+						t.Error("upstream remained open after terminal event")
+					}
 				}
 				return
 			}
@@ -462,6 +471,22 @@ func TestNativePlugin(t *testing.T) {
 		}
 	})
 
+	t.Run("terminal events close a connected upstream", func(t *testing.T) {
+		for _, route := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+			body := map[string]any{"model": "copilot/account-model", "input": "hold-after-terminal", "stream": true, "max_tokens": 32, "messages": []any{map[string]string{"role": "user", "content": "hold-after-terminal"}}}
+			started := time.Now()
+			code, raw := request("POST", route, "client-test-key", body)
+			if code != 200 || time.Since(started) > 3*time.Second {
+				t.Fatalf("terminal did not complete promptly on %s: %d %s", route, code, raw)
+			}
+			assertStreamFraming(t, route, raw)
+			select {
+			case <-terminalCanceled:
+			case <-time.After(time.Second):
+				t.Fatalf("upstream not canceled after terminal on %s", route)
+			}
+		}
+	})
 	t.Run("safe errors", func(t *testing.T) {
 		code, b := request("POST", "/v1/responses", "client-test-key", map[string]any{"model": "copilot/account-model", "input": "force-429"})
 		if code != 429 || bytes.Contains(b, []byte("secret-must-not-leak")) {

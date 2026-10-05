@@ -78,8 +78,11 @@ jobs:
             dist/**/*.dll
           if-no-files-found: error
 
+  native-integration:
+    uses: ./.github/workflows/native-integration.yml
+
   package:
-    needs: build
+    needs: [build, native-integration]
     runs-on: ubuntu-26.04
     permissions:
       contents: write
