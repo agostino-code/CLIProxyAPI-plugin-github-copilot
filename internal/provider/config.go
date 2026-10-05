@@ -54,7 +54,11 @@ func DefaultConfig() Config {
 
 func ParseConfig(raw []byte) (Config, error) {
 	cfg := DefaultConfig()
+	var supplied map[string]any
 	if len(raw) > 0 {
+		if err := yaml.Unmarshal(raw, &supplied); err != nil {
+			return Config{}, fmt.Errorf("decode plugin config: %w", err)
+		}
 		if errUnmarshal := yaml.Unmarshal(raw, &cfg); errUnmarshal != nil {
 			return Config{}, fmt.Errorf("decode plugin config: %w", errUnmarshal)
 		}
@@ -85,6 +89,9 @@ func ParseConfig(raw []byte) (Config, error) {
 	cfg.GitHubAPIURL = strings.TrimRight(strings.TrimSpace(cfg.GitHubAPIURL), "/")
 	cfg.CopilotAPIURL = strings.TrimRight(strings.TrimSpace(cfg.CopilotAPIURL), "/")
 	cfg.ModelsExcluded = normalizeModelPrefixes(cfg.ModelsExcluded)
+	if err := cfg.configureEnterprise(supplied); err != nil {
+		return Config{}, err
+	}
 	if cfg.GitHubClientID == "" {
 		return Config{}, fmt.Errorf("github_client_id is required")
 	}
@@ -135,7 +142,10 @@ func validateBaseURL(raw string, allowInsecure bool) error {
 	if parsed.Scheme != "https" && !(allowInsecure && parsed.Scheme == "http" && (parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "localhost" || parsed.Hostname() == "::1")) {
 		return fmt.Errorf("URL must use HTTPS")
 	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if strings.HasSuffix(parsed.Hostname(), ".") {
+		return fmt.Errorf("base URL hostname must not have a trailing dot")
+	}
+	if parsed.User != nil || parsed.ForceQuery || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("base URL must not contain query or fragment")
 	}
 	return nil
@@ -151,4 +161,70 @@ func (c Config) modelCacheTTL() time.Duration {
 
 func (c Config) tokenExpiryBuffer() time.Duration {
 	return time.Duration(c.TokenExpiryBufferSeconds) * time.Second
+}
+
+// enterpriseHost accepts a single tenant label, not arbitrary ghe.com subdomains.
+func (c Config) enterpriseHost() string {
+	u, err := url.Parse(c.GitHubBaseURL)
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	label, ok := strings.CutSuffix(host, ".ghe.com")
+	if !ok || label == "" || strings.Contains(label, ".") {
+		return ""
+	}
+	for i, r := range label {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' && i > 0 && i < len(label)-1) {
+			return ""
+		}
+	}
+	if len(label) > 63 {
+		return ""
+	}
+	return host
+}
+
+func (c *Config) configureEnterprise(supplied map[string]any) error {
+	base, err := url.Parse(c.GitHubBaseURL)
+	if err != nil {
+		return fmt.Errorf("invalid GitHub base URL")
+	}
+	host := c.enterpriseHost()
+	if host == "" {
+		// A partial tenant override must never keep public OAuth defaults.
+		for _, raw := range []string{c.GitHubBaseURL, c.GitHubAPIURL, c.CopilotAPIURL} {
+			u, e := url.Parse(raw)
+			if e == nil && (strings.EqualFold(u.Hostname(), "ghe.com") || strings.HasSuffix(strings.ToLower(u.Hostname()), ".ghe.com")) {
+				return fmt.Errorf("GHE.com requires github_base_url https://TENANT.ghe.com")
+			}
+		}
+		return nil
+	}
+	if base.Scheme != "https" || base.Port() != "" || base.Path != "" || base.User != nil || base.ForceQuery || base.RawQuery != "" || base.Fragment != "" {
+		return fmt.Errorf("GHE.com github_base_url must be a tenant HTTPS origin without a port or path")
+	}
+	c.GitHubBaseURL = "https://" + host
+	if _, ok := supplied["github_api_url"]; !ok {
+		c.GitHubAPIURL = "https://api." + host
+	}
+	if _, ok := supplied["copilot_api_url"]; !ok {
+		c.CopilotAPIURL = "https://copilot-api." + host
+	}
+	if client, ok := supplied["github_client_id"].(string); !ok || strings.TrimSpace(client) == "" || strings.TrimSpace(c.GitHubClientID) == "" {
+		return fmt.Errorf("GHE.com requires an explicit github_client_id approved for the tenant's device flow")
+	}
+	for name, raw := range map[string]string{"github_api_url": c.GitHubAPIURL, "copilot_api_url": c.CopilotAPIURL} {
+		u, e := url.Parse(raw)
+		if e != nil || u.Scheme != "https" || u.Port() != "" || u.Path != "" || u.User != nil || u.ForceQuery || u.RawQuery != "" || u.Fragment != "" || !strings.HasSuffix(strings.ToLower(u.Hostname()), "."+host) {
+			return fmt.Errorf("%s must be an HTTPS origin within the configured GHE.com tenant", name)
+		}
+	}
+	return nil
+}
+
+// Endpoint changes require a new service: in-flight grants and credentials must
+// never be routed to a different tenant during a configuration reload.
+func (c Config) sameAuthRouting(other Config) bool {
+	return c.GitHubBaseURL == other.GitHubBaseURL && c.GitHubAPIURL == other.GitHubAPIURL && c.CopilotAPIURL == other.CopilotAPIURL && c.GitHubClientID == other.GitHubClientID && c.AllowInsecureBaseURLs == other.AllowInsecureBaseURLs
 }

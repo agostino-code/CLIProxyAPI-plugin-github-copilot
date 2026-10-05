@@ -226,28 +226,23 @@ func (s *Service) pumpStream(outputID, endpoint, destination, model string, orig
 	var state any
 	terminal := false
 	emit := func(frame []byte) error {
-		for _, line := range bytes.Split(frame, []byte("\n")) {
-			line = bytes.TrimSpace(line)
-			if !bytes.HasPrefix(line, []byte("data:")) {
-				continue
-			}
-			data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-			if endpoint == translate.EndpointChatCompletions && bytes.Equal(data, []byte("[DONE]")) {
-				terminal = true
-			}
-			var event struct {
-				Type string `json:"type"`
-			}
-			if json.Unmarshal(data, &event) == nil {
-				switch event.Type {
-				case "response.completed", "response.incomplete":
-					terminal = endpoint == translate.EndpointResponses
-				case "message_stop":
-					terminal = endpoint == translate.EndpointMessages
-				case "response.failed", "error":
-					return errors.New("upstream stream failed")
-				}
-			}
+		eventName, data := streamEventData(frame)
+		var event struct {
+			Type  string          `json:"type"`
+			Error json.RawMessage `json:"error"`
+		}
+		_ = json.Unmarshal(data, &event)
+		if eventName == "error" || eventName == "response.failed" || event.Type == "error" || event.Type == "response.failed" || len(event.Error) > 0 && !bytes.Equal(event.Error, []byte("null")) {
+			return errors.New("upstream stream failed")
+		}
+		if endpoint == translate.EndpointChatCompletions && bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
+			terminal = true
+		}
+		switch event.Type {
+		case "response.completed", "response.incomplete":
+			terminal = endpoint == translate.EndpointResponses
+		case "message_stop":
+			terminal = endpoint == translate.EndpointMessages
 		}
 		frames, errTranslate := translate.StreamFromEndpoint(ctx, endpoint, destination, model, original, translated, frame, &state)
 		if errTranslate != nil {
@@ -261,8 +256,25 @@ func (s *Service) pumpStream(outputID, endpoint, destination, model string, orig
 			if errTranslate != nil {
 				return errTranslate
 			}
-			if errEmit := s.host.Emit(ctx, outputID, output); errEmit != nil {
-				return errEmit
+			chunks := [][]byte{output}
+			if destination == "openai" {
+				chunks, errTranslate = formatOpenAIStreamChunksForHost(output)
+				if errTranslate != nil {
+					return errTranslate
+				}
+				// Some translators return several SSE events in one output. Rewrite
+				// each extracted JSON object as well so none retains a native ID.
+				for i, chunk := range chunks {
+					chunks[i], errTranslate = rewriteResponseModel(chunk, model)
+					if errTranslate != nil {
+						return errTranslate
+					}
+				}
+			}
+			for _, chunk := range chunks {
+				if errEmit := s.host.Emit(ctx, outputID, chunk); errEmit != nil {
+					return errEmit
+				}
 			}
 		}
 		return nil
@@ -295,6 +307,44 @@ func (s *Service) pumpStream(outputID, endpoint, destination, model string, orig
 			return
 		}
 	}
+}
+
+// streamEventData joins all data fields in one SSE event before parsing JSON.
+// Inspecting each line separately misses multiline error and terminal events.
+func streamEventData(frame []byte) (string, []byte) {
+	var event string
+	var data [][]byte
+	for _, line := range bytes.Split(bytes.ReplaceAll(frame, []byte("\r\n"), []byte("\n")), []byte("\n")) {
+		field, value, _ := bytes.Cut(line, []byte(":"))
+		value = bytes.TrimPrefix(value, []byte(" "))
+		switch string(field) {
+		case "event":
+			event = string(value)
+		case "data":
+			data = append(data, value)
+		}
+	}
+	return event, bytes.Join(data, []byte("\n"))
+}
+
+// CLIProxyAPI wraps each Chat Completions chunk in its own data: frame
+// and appends [DONE]. Emit one compact JSON object per event, without either
+// wrapper. Other client protocols still require complete SSE frames.
+func formatOpenAIStreamChunksForHost(frame []byte) ([][]byte, error) {
+	var chunks [][]byte
+	for _, event := range bytes.Split(bytes.ReplaceAll(frame, []byte("\r\n"), []byte("\n")), []byte("\n\n")) {
+		_, data := streamEventData(event)
+		data = bytes.TrimSpace(data)
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		var compact bytes.Buffer
+		if data[0] != '{' || json.Compact(&compact, data) != nil {
+			return nil, errors.New("invalid Chat Completions stream event")
+		}
+		chunks = append(chunks, compact.Bytes())
+	}
+	return chunks, nil
 }
 
 func normalizeRequestFormat(value string) string {

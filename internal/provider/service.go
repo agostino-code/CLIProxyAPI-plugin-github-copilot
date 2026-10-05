@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ type Service struct {
 	startOnce     sync.Once
 	configMu      sync.RWMutex
 	config        Config
+	configured    bool
 	oauthMu       sync.Mutex
 	oauthSession  map[string]*deviceSession
 	tokenMu       sync.Mutex
@@ -71,6 +73,11 @@ func (s *Service) Configure(raw []byte) error {
 		return err
 	}
 	s.configMu.Lock()
+	if s.configured && !s.config.sameAuthRouting(cfg) {
+		s.configMu.Unlock()
+		return errors.New("authentication endpoint changes require a plugin restart")
+	}
+	s.configured = true
 	changed := !reflect.DeepEqual(s.config, cfg)
 	s.config = cfg
 	s.configMu.Unlock()
