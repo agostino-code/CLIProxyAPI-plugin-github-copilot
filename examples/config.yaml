@@ -17,7 +17,9 @@ plugins:
       github_base_url: https://github.com
       github_api_url: https://api.github.com
       copilot_api_url: https://api.githubcopilot.com
-      allow_insecure_base_urls: false # Test-only HTTP on loopback.
+      allow_insecure_base_urls: false # Explicit test-only loopback endpoints; allows HTTP.
+      allow_custom_endpoints: false # Trust other non-GHE HTTPS endpoints with credentials/prompts.
+      allow_custom_scopes: false # Explicitly opt in before requesting scopes beyond read:user.
       oauth_timeout_seconds: 900
       model_cache_ttl_seconds: 60 # 30-60 seconds, never stale fallback.
       token_expiry_buffer_seconds: 300

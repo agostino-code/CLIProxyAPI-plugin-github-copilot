@@ -83,7 +83,7 @@ func (h *failingStreamHost) CloseOutput(_ context.Context, _ string, message str
 func TestStreamErrorsDoNotExposeBackendDetails(t *testing.T) {
 	h := &failingStreamHost{}
 	s := newTestService(t, h)
-	s.pumpStream("out", "/responses", "claude", "model", nil, nil, transport.Stream{ID: "in"})
+	s.pumpStream(context.Background(), "out", "/responses", "claude", "model", nil, nil, transport.Stream{ID: "in"}, streamIdleTimeout)
 	if h.message == "" || strings.Contains(h.message, "private-backend-details") {
 		t.Fatalf("unsafe stream error %q", h.message)
 	}
@@ -150,11 +150,11 @@ func (h *recordingStreamHost) CloseStream(context.Context, string) error { h.clo
 
 func TestPumpStreamChatHostFraming(t *testing.T) {
 	h := &recordingStreamHost{chunks: []transport.StreamChunk{
-		{Payload: []byte("data: {\"model\":\"native\",\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\r\n\r\ndata: [DO")},
+		{Payload: []byte("data: {\"model\":\"native\",\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: [DO")},
 		{Payload: []byte("NE]\n\n"), Done: true},
 	}}
 	s := newTestService(t, h)
-	s.pumpStream("out", "/chat/completions", "openai", "copilot/native", nil, nil, transport.Stream{ID: "in"})
+	s.pumpStream(context.Background(), "out", "/chat/completions", "openai", "copilot/native", nil, nil, transport.Stream{ID: "in"}, streamIdleTimeout)
 	if h.message != "" || h.closes != 1 || len(h.outputs) != 1 {
 		t.Fatalf("message=%q closes=%d outputs=%q", h.message, h.closes, h.outputs)
 	}
@@ -172,7 +172,7 @@ func TestPumpStreamRejectsErrorsBeforeEmit(t *testing.T) {
 		} {
 			h := &recordingStreamHost{chunks: []transport.StreamChunk{{Payload: []byte(frame), Done: true}}}
 			s := newTestService(t, h)
-			s.pumpStream("out", "/responses", destination, "copilot/model", nil, nil, transport.Stream{ID: "in"})
+			s.pumpStream(context.Background(), "out", "/responses", destination, "copilot/model", nil, nil, transport.Stream{ID: "in"}, streamIdleTimeout)
 			if len(h.outputs) != 0 || h.message == "" || strings.Contains(h.message, "private-backend-details") || h.closes != 1 {
 				t.Fatalf("unsafe failure destination=%s outputs=%q message=%q closes=%d", destination, h.outputs, h.message, h.closes)
 			}
@@ -187,7 +187,7 @@ func TestPumpStreamKeepsOtherProtocolFraming(t *testing.T) {
 	} {
 		h := &recordingStreamHost{chunks: []transport.StreamChunk{{Payload: []byte(tc.frame), Done: true}}}
 		s := newTestService(t, h)
-		s.pumpStream("out", tc.endpoint, tc.destination, "copilot/model", nil, nil, transport.Stream{ID: "in"})
+		s.pumpStream(context.Background(), "out", tc.endpoint, tc.destination, "copilot/model", nil, nil, transport.Stream{ID: "in"}, streamIdleTimeout)
 		if h.message != "" || len(h.outputs) != 1 || string(h.outputs[0]) != tc.frame {
 			t.Fatalf("framing changed: message=%q outputs=%q", h.message, h.outputs)
 		}

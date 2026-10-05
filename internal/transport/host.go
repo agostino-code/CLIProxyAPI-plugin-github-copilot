@@ -16,6 +16,12 @@ type Client struct {
 	streams sync.Map
 }
 
+type streamState struct {
+	finish    func()
+	closeOnce sync.Once
+	closeErr  error
+}
+
 func New(c Caller) *Client { return &Client{Caller: c} }
 
 type operation struct {
@@ -48,12 +54,12 @@ func (c *Client) start(ctx context.Context, callback string) (operation, func(),
 	cancel := func() { once.Do(func() { _ = c.Call("host.http.cancel", op, nil) }) }
 	done := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() { defer close(done); cancel() })
-	finish := func() {
+	finish := sync.OnceFunc(func() {
 		if !stop() {
 			<-done
 		}
 		cancel()
-	}
+	})
 	return op, finish, nil
 }
 
@@ -100,42 +106,93 @@ func (c *Client) OpenStream(ctx context.Context, callback string, r Request) (St
 	// successful operation here: stream_close owns its lifetime from this point.
 	if err != nil || out.ID == "" {
 		finish()
+		if ctx.Err() != nil {
+			return Stream{}, ctx.Err()
+		}
 		if err == nil {
 			err = errors.New("host returned no stream")
 		}
 		return Stream{}, err
 	}
-	// Register cancellation until CloseStream, including before first headers.
-	c.streamsStore(out.ID, finish)
+	// Keep the operation's cancellation hook until CloseStream. Cancellation
+	// may race with successful headers, so register cleanup before checking it.
+	c.streams.Store(out.ID, &streamState{finish: finish})
+	if err := ctx.Err(); err != nil {
+		_ = c.CloseStream(context.Background(), out.ID)
+		return Stream{}, err
+	}
 	return Stream{out.StatusCode, out.Headers, out.ID}, nil
 }
 
 // Stream bookkeeping is per Client, never shared between plugin generations.
 
-func (c *Client) streamsStore(id string, finish func()) { c.streams.Store(id, finish) }
 func (c *Client) ReadStream(ctx context.Context, id string) (StreamChunk, error) {
 	if err := ctx.Err(); err != nil {
+		_ = c.CloseStream(context.Background(), id)
 		return StreamChunk{}, err
 	}
+	// Native calls cannot receive this read's context. Close the host stream on
+	// cancellation to cancel its HTTP operation and unblock the synchronous
+	// read; never leave a blocked native call behind in a detached goroutine.
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		_ = c.CloseStream(context.Background(), id)
+	})
 	var out StreamChunk
 	err := c.Call("host.http.stream_read", streamID{id}, &out)
+	if !stop() {
+		<-done
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// Also cover cancellation racing with a successful stop of the hook.
+		_ = c.CloseStream(context.Background(), id)
+		return StreamChunk{}, ctxErr
+	}
 	return out, err
 }
 func (c *Client) CloseStream(_ context.Context, id string) error {
-	err := c.Call("host.http.stream_close", streamID{id}, nil)
-	if f, ok := c.streams.LoadAndDelete(id); ok {
-		f.(func())()
+	v, ok := c.streams.Load(id)
+	if !ok {
+		return nil
 	}
-	return err
+	state := v.(*streamState)
+	state.closeOnce.Do(func() {
+		state.closeErr = c.Call("host.http.stream_close", streamID{id}, nil)
+		state.finish()
+	})
+	// Leave the state visible until cleanup is complete so concurrent closes
+	// wait for the same callbacks instead of returning while cleanup runs.
+	c.streams.CompareAndDelete(id, state)
+	return state.closeErr
 }
 func (c *Client) Emit(ctx context.Context, id string, b []byte) error {
 	if err := ctx.Err(); err != nil {
+		c.CloseOutput(context.Background(), id, "response stream canceled")
 		return err
 	}
-	return c.Call("host.stream.emit", struct {
+	// A full host output queue can block the native emit call. Closing that
+	// output releases its emitter even when the downstream reader is stalled.
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		c.CloseOutput(context.Background(), id, "response stream canceled")
+	})
+	err := c.Call("host.stream.emit", struct {
 		ID      string `json:"stream_id"`
 		Payload []byte `json:"payload"`
 	}{id, b}, nil)
+	stopped := stop()
+	if !stopped {
+		<-done
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if stopped {
+			c.CloseOutput(context.Background(), id, "response stream canceled")
+		}
+		return ctxErr
+	}
+	return err
 }
 func (c *Client) CloseOutput(_ context.Context, id, message string) {
 	_ = c.Call("host.stream.close", struct {
