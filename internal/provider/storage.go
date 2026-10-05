@@ -13,6 +13,7 @@ import (
 
 type authStorage struct {
 	Extra                 map[string]json.RawMessage `json:"-"`
+	GitHubBaseURL         string                     `json:"github_base_url,omitempty"`
 	Type                  string                     `json:"type"`
 	GitHubAccessToken     string                     `json:"github_access_token"`
 	GitHubRefreshToken    string                     `json:"github_refresh_token,omitempty"`
@@ -72,6 +73,9 @@ func authData(storage authStorage, id, fileName, prefix, proxyURL string, disabl
 	}
 	if fileName == "" {
 		fileName = credentialFileName(storage.GitHubLogin)
+		if (Config{GitHubBaseURL: storage.GitHubBaseURL}).enterpriseHost() != "" {
+			fileName = strings.TrimSuffix(fileName, ".json") + "-" + tokenFingerprint(storage.GitHubBaseURL)[:16] + ".json"
+		}
 	}
 	if id == "" {
 		id = fileName
@@ -144,4 +148,22 @@ func credentialFileName(login string) string {
 func tokenFingerprint(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
+}
+
+// Legacy unbound credentials remain compatible with public GitHub and existing
+// trusted custom installations, but never acquire a GHE.com tenant implicitly.
+// Explicit issuer binding prevents reuse of newly created credentials elsewhere.
+func (c Config) validateStorageOrigin(storage authStorage) error {
+	origin := storage.GitHubBaseURL
+	if origin == "" {
+		if c.enterpriseHost() != "" {
+			return fmt.Errorf("GHE.com credential is missing github_base_url; authenticate for this tenant")
+		}
+		// Keep existing trusted custom/loopback installations compatible.
+		return nil
+	}
+	if origin != c.GitHubBaseURL {
+		return fmt.Errorf("credential belongs to a different GitHub origin")
+	}
+	return nil
 }

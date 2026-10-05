@@ -28,6 +28,9 @@ type Plugin struct {
 	service     *provider.Service
 	host        transport.Caller
 	config      []byte
+	// Keep the accepted routing even while disabled so disable/re-enable cannot
+	// bypass the restart requirement for credentials and pending OAuth grants.
+	authRouting *provider.Config
 	configError string
 	closed      bool
 }
@@ -142,14 +145,39 @@ func (p *Plugin) dispatch(method string, request []byte) (any, error) {
 		p.configureMu.Lock()
 		defer p.configureMu.Unlock()
 		p.mu.RLock()
-		same := p.service != nil && bytes.Equal(p.config, req.ConfigYAML)
+		same := p.authRouting != nil && bytes.Equal(p.config, req.ConfigYAML)
+		closed := p.closed
 		p.mu.RUnlock()
+		if closed {
+			return nil, &provider.StatusError{Code: "unavailable", Message: "plugin has been shut down", HTTPStatus: http.StatusServiceUnavailable}
+		}
 		if same {
+			p.mu.Lock()
+			p.configError = ""
+			p.mu.Unlock()
 			return pluginRegistration(), nil
 		}
 		next := provider.New(transport.New(p.host))
-		err := next.Configure(req.ConfigYAML)
-		if err != nil || !next.Config().Enabled {
+		if err := next.Configure(req.ConfigYAML); err != nil {
+			next.Shutdown()
+			p.mu.Lock()
+			p.configError = err.Error()
+			p.mu.Unlock()
+			return nil, &provider.StatusError{Code: "invalid_config", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+		}
+		cfg := next.Config()
+		p.mu.RLock()
+		routing := p.authRouting
+		if p.service != nil {
+			active := p.service.Config()
+			routing = &active
+		}
+		p.mu.RUnlock()
+		if routing != nil && !routing.SameAuthRouting(cfg) {
+			next.Shutdown()
+			return nil, &provider.StatusError{Code: "restart_required", Message: "authentication endpoint, client, scope, or trust changes require a plugin restart", HTTPStatus: http.StatusBadRequest}
+		}
+		if !cfg.Enabled {
 			next.Shutdown()
 			next = nil
 		}
@@ -157,10 +185,8 @@ func (p *Plugin) dispatch(method string, request []byte) (any, error) {
 		old := p.service
 		p.service = next
 		p.config = append([]byte(nil), req.ConfigYAML...)
+		p.authRouting = &cfg
 		p.configError = ""
-		if err != nil {
-			p.configError = err.Error()
-		}
 		p.mu.Unlock()
 		if old != nil {
 			old.Shutdown()
@@ -269,6 +295,9 @@ func pluginRegistration() registration {
 				{Name: "github_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "GitHub web OAuth base URL."},
 				{Name: "github_api_url", Type: pluginapi.ConfigFieldTypeString, Description: "GitHub REST API base URL used for identity and Copilot token exchange."},
 				{Name: "copilot_api_url", Type: pluginapi.ConfigFieldTypeString, Description: "Fallback Copilot API base URL when the token response has no API endpoint."},
+				{Name: "allow_insecure_base_urls", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Opt in to HTTP loopback endpoints for local testing only; disabled by default. Changing this requires a plugin restart."},
+				{Name: "allow_custom_endpoints", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Opt in to custom HTTPS endpoints outside the default GitHub and Copilot origins; disabled by default. Only enable for endpoints you trust with credentials. GHE.com tenant restrictions still apply. Changing this requires a plugin restart."},
+				{Name: "allow_custom_scopes", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Opt in to OAuth scopes other than read:user; disabled by default. Broader scopes may grant additional account access. Changing this requires a plugin restart."},
 				{Name: "oauth_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum device-code lifetime accepted by the plugin."},
 				{Name: "token_expiry_buffer_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Refresh Copilot API tokens this long before expiration."},
 			},

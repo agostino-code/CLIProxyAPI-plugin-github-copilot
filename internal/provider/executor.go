@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
@@ -23,7 +25,12 @@ const (
 	copilotPluginVersion = "copilot-chat/0.67.0"
 	copilotIntegrationID = "vscode-chat"
 	copilotAPIVersion    = "2026-08-01"
+	streamIdleTimeout    = 2 * time.Minute
+	streamTotalTimeout   = 30 * time.Minute
+	streamMaxChoices     = 256
 )
+
+type streamTimeouts struct{ idle, total time.Duration }
 
 type ExecuteRequest struct {
 	pluginapi.ExecutorRequest
@@ -80,6 +87,12 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 }
 
 func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.Header, error) {
+	return s.executeStreamWithTimeouts(ctx, req, streamTimeouts{idle: streamIdleTimeout, total: streamTotalTimeout})
+}
+
+// The opening request and pump share one lifetime. Canceling a temporary opening
+// context after headers would also cancel the host's underlying HTTP request.
+func (s *Service) executeStreamWithTimeouts(ctx context.Context, req ExecuteRequest, limits streamTimeouts) (http.Header, error) {
 	if strings.TrimSpace(req.StreamID) == "" {
 		return nil, statusError("invalid_request", "stream_id is required", http.StatusBadRequest)
 	}
@@ -95,6 +108,21 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	if errParse != nil {
 		return nil, errParse
 	}
+	ctx, cancel := context.WithTimeout(ctx, limits.total)
+	shutdownDone := make(chan struct{})
+	stopShutdown := context.AfterFunc(s.ctx, func() { defer close(shutdownDone); cancel() })
+	finish := func() {
+		cancel()
+		if !stopShutdown() {
+			<-shutdownDone
+		}
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			finish()
+		}
+	}()
 	endpoint, token, errEndpoint := s.endpointForFormat(ctx, req.HostCallbackID, req.AuthID, storage, nativeModel, sourceFormat)
 	if errEndpoint != nil {
 		return nil, errEndpoint
@@ -103,23 +131,40 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	if errTranslate != nil {
 		return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
 	}
-	upstream, token, errOpen := s.openModelStream(ctx, req.HostCallbackID, req.AuthID, storage, token, endpoint, requestBody)
+	// Bound waiting for the first headers as well as later reads. Join a fired
+	// timer before proceeding so it cannot cancel a successfully transferred pump.
+	upstream, token, errOpen := func() (transport.Stream, copilotTokenEntry, error) {
+		timeoutDone := make(chan struct{})
+		timer := time.AfterFunc(limits.idle, func() { defer close(timeoutDone); cancel() })
+		defer func() {
+			if !timer.Stop() {
+				<-timeoutDone
+			}
+		}()
+		return s.openModelStream(ctx, req.HostCallbackID, req.AuthID, storage, token, endpoint, requestBody)
+	}()
 	if errOpen != nil {
 		return nil, errOpen
 	}
+	if err := ctx.Err(); err != nil {
+		_ = s.host.CloseStream(context.Background(), upstream.ID)
+		return nil, err
+	}
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
-		body, errCollect := s.collectStreamError(ctx, upstream)
+		body, errCollect := s.collectStreamError(ctx, upstream, limits.idle)
 		if errCollect != nil {
 			return nil, errCollect
 		}
 		return nil, upstreamStatusError(upstream.StatusCode, redact.ErrorBody(body, token.Token, storage.GitHubAccessToken))
 	}
 	if !s.spawn(func() {
-		s.pumpStream(req.StreamID, endpoint, sourceFormat, req.Model, req.OriginalRequest, requestBody, upstream)
+		defer finish()
+		s.pumpStream(ctx, req.StreamID, endpoint, sourceFormat, req.Model, req.OriginalRequest, requestBody, upstream, limits.idle)
 	}) {
-		_ = s.host.CloseStream(ctx, upstream.ID)
+		_ = s.host.CloseStream(context.Background(), upstream.ID)
 		return nil, errors.New("plugin shutting down")
 	}
+	transferred = true
 	headers := filterResponseHeaders(upstream.Headers)
 	headers.Set("Content-Type", "text/event-stream")
 	headers.Set("Cache-Control", "no-cache")
@@ -186,13 +231,19 @@ func (s *Service) openModelStream(ctx context.Context, callbackID, authID string
 	return stream, token, nil
 }
 
-func (s *Service) collectStreamError(ctx context.Context, stream transport.Stream) ([]byte, error) {
+func (s *Service) collectStreamError(ctx context.Context, stream transport.Stream, idleTimeout time.Duration) ([]byte, error) {
 	defer func() { _ = s.host.CloseStream(context.Background(), stream.ID) }()
 	var body []byte
+	lastActivity := time.Now()
 	for {
-		chunk, errRead := s.host.ReadStream(ctx, stream.ID)
+		readCtx, cancel := context.WithDeadline(ctx, lastActivity.Add(idleTimeout))
+		chunk, errRead := s.host.ReadStream(readCtx, stream.ID)
+		cancel()
 		if errRead != nil {
 			return nil, fmt.Errorf("read Copilot error stream: %w", errRead)
+		}
+		if len(chunk.Payload) > 0 {
+			lastActivity = time.Now()
 		}
 		if len(body)+len(chunk.Payload) > 1<<20 {
 			return nil, errors.New("upstream error body too large")
@@ -207,14 +258,14 @@ func (s *Service) collectStreamError(ctx context.Context, stream transport.Strea
 	}
 }
 
-func (s *Service) pumpStream(outputID, endpoint, destination, model string, original, translated []byte, upstream transport.Stream) {
-	ctx := s.ctx
+func (s *Service) pumpStream(ctx context.Context, outputID, endpoint, destination, model string, original, translated []byte, upstream transport.Stream, idleTimeout time.Duration) {
 	var terminalErr error
+	closeUpstream := sync.OnceFunc(func() { _ = s.host.CloseStream(context.Background(), upstream.ID) })
 	defer func() {
 		if recover() != nil {
 			terminalErr = errors.New("upstream stream processing failed")
 		}
-		_ = s.host.CloseStream(ctx, upstream.ID)
+		closeUpstream()
 		message := ""
 		if terminalErr != nil {
 			message = "copilot stream failed or was canceled" // Upstream translation errors may contain private response text.
@@ -225,29 +276,54 @@ func (s *Service) pumpStream(outputID, endpoint, destination, model string, orig
 	decoder := &sse.Decoder{}
 	var state any
 	terminal := false
+	finishedChoices := make(map[int]bool)
 	emit := func(frame []byte) error {
-		for _, line := range bytes.Split(frame, []byte("\n")) {
-			line = bytes.TrimSpace(line)
-			if !bytes.HasPrefix(line, []byte("data:")) {
-				continue
+		eventName, data := streamEventData(frame)
+		var event struct {
+			Type    string          `json:"type"`
+			Error   json.RawMessage `json:"error"`
+			Choices []struct {
+				Index        int     `json:"index"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		isDone := endpoint == translate.EndpointChatCompletions && bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]"))
+		if len(bytes.TrimSpace(data)) > 0 && !isDone && json.Unmarshal(data, &event) != nil {
+			return errors.New("invalid upstream stream event")
+		}
+		if eventName == "error" || eventName == "response.failed" || event.Type == "error" || event.Type == "response.failed" || len(event.Error) > 0 && !bytes.Equal(event.Error, []byte("null")) {
+			return errors.New("upstream stream failed")
+		}
+		if endpoint == translate.EndpointChatCompletions {
+			for _, choice := range event.Choices {
+				if choice.Index < 0 {
+					return errors.New("invalid upstream stream choice index")
+				}
+				if _, seen := finishedChoices[choice.Index]; !seen && len(finishedChoices) >= streamMaxChoices {
+					return errors.New("upstream stream has too many choices")
+				}
+				finishedChoices[choice.Index] = finishedChoices[choice.Index] || choice.FinishReason != nil && strings.TrimSpace(*choice.FinishReason) != ""
 			}
-			data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-			if endpoint == translate.EndpointChatCompletions && bytes.Equal(data, []byte("[DONE]")) {
-				terminal = true
+		}
+		if isDone {
+			if len(finishedChoices) == 0 {
+				return errors.New("upstream stream ended without a finish reason")
 			}
-			var event struct {
-				Type string `json:"type"`
-			}
-			if json.Unmarshal(data, &event) == nil {
-				switch event.Type {
-				case "response.completed", "response.incomplete":
-					terminal = endpoint == translate.EndpointResponses
-				case "message_stop":
-					terminal = endpoint == translate.EndpointMessages
-				case "response.failed", "error":
-					return errors.New("upstream stream failed")
+			for _, finished := range finishedChoices {
+				if !finished {
+					return errors.New("upstream stream ended without a finish reason")
 				}
 			}
+			terminal = true
+		}
+		switch event.Type {
+		case "response.completed", "response.incomplete":
+			terminal = endpoint == translate.EndpointResponses
+		case "message_stop":
+			terminal = endpoint == translate.EndpointMessages
+		}
+		if terminal {
+			closeUpstream()
 		}
 		frames, errTranslate := translate.StreamFromEndpoint(ctx, endpoint, destination, model, original, translated, frame, &state)
 		if errTranslate != nil {
@@ -269,13 +345,35 @@ func (s *Service) pumpStream(outputID, endpoint, destination, model string, orig
 			}
 			if errEmit := s.host.Emit(ctx, outputID, output); errEmit != nil {
 				return errEmit
+			chunks := [][]byte{output}
+			if destination == "openai" {
+				chunks, errTranslate = formatOpenAIStreamChunksForHost(output)
+				if errTranslate != nil {
+					return errTranslate
+				}
+				// Some translators return several SSE events in one output. Rewrite
+				// each extracted JSON object as well so none retains a native ID.
+				for i, chunk := range chunks {
+					chunks[i], errTranslate = rewriteResponseModel(chunk, model)
+					if errTranslate != nil {
+						return errTranslate
+					}
+				}
+			}
+			for _, chunk := range chunks {
+				if errEmit := s.host.Emit(ctx, outputID, chunk); errEmit != nil {
+					return errEmit
+				}
 			}
 		}
 		return nil
 	}
 
+	lastActivity := time.Now()
 	for {
-		chunk, errRead := s.host.ReadStream(ctx, upstream.ID)
+		readCtx, cancel := context.WithDeadline(ctx, lastActivity.Add(idleTimeout))
+		chunk, errRead := s.host.ReadStream(readCtx, upstream.ID)
+		cancel()
 		if errRead != nil {
 			terminalErr = fmt.Errorf("read Copilot stream: %w", errRead)
 			return
@@ -283,6 +381,9 @@ func (s *Service) pumpStream(outputID, endpoint, destination, model string, orig
 		if chunk.Error != "" {
 			terminalErr = errors.New("upstream stream transport failed")
 			return
+		}
+		if len(chunk.Payload) > 0 {
+			lastActivity = time.Now()
 		}
 		if decoder.Buffered()+len(chunk.Payload) > 8<<20 {
 			terminalErr = errors.New("upstream stream event too large")
@@ -293,6 +394,9 @@ func (s *Service) pumpStream(outputID, endpoint, destination, model string, orig
 				terminalErr = fmt.Errorf("translate Copilot stream: %w", errEmit)
 				return
 			}
+			if terminal {
+				return
+			}
 		}
 		if chunk.Done {
 			if len(bytes.TrimSpace(decoder.Flush())) > 0 || !terminal {
@@ -301,6 +405,44 @@ func (s *Service) pumpStream(outputID, endpoint, destination, model string, orig
 			return
 		}
 	}
+}
+
+// streamEventData joins all data fields in one SSE event before parsing JSON.
+// Inspecting each line separately misses multiline error and terminal events.
+func streamEventData(frame []byte) (string, []byte) {
+	var event string
+	var data [][]byte
+	for _, line := range bytes.Split(bytes.ReplaceAll(frame, []byte("\r\n"), []byte("\n")), []byte("\n")) {
+		field, value, _ := bytes.Cut(line, []byte(":"))
+		value = bytes.TrimPrefix(value, []byte(" "))
+		switch string(field) {
+		case "event":
+			event = string(value)
+		case "data":
+			data = append(data, value)
+		}
+	}
+	return event, bytes.Join(data, []byte("\n"))
+}
+
+// CLIProxyAPI wraps each Chat Completions chunk in its own data: frame
+// and appends [DONE]. Emit one compact JSON object per event, without either
+// wrapper. Other client protocols still require complete SSE frames.
+func formatOpenAIStreamChunksForHost(frame []byte) ([][]byte, error) {
+	var chunks [][]byte
+	for _, event := range bytes.Split(bytes.ReplaceAll(frame, []byte("\r\n"), []byte("\n")), []byte("\n\n")) {
+		_, data := streamEventData(event)
+		data = bytes.TrimSpace(data)
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		var compact bytes.Buffer
+		if data[0] != '{' || json.Compact(&compact, data) != nil {
+			return nil, errors.New("invalid Chat Completions stream event")
+		}
+		chunks = append(chunks, compact.Bytes())
+	}
+	return chunks, nil
 }
 
 func normalizeRequestFormat(value string) string {
